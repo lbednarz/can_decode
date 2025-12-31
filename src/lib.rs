@@ -306,6 +306,7 @@ impl Parser {
             can_dbc::Transmitter::VectorXXX => "Unknown".to_string(),
         };
         let mut decoded_signals = std::collections::HashMap::new();
+        let mut any_ok = false;
 
         for signal_def in &msg_def.signals {
             match self.decode_signal(signal_def, data) {
@@ -318,9 +319,12 @@ impl Parser {
                         signal_def.name,
                         msg_def.name
                     );
-                    return None;
                 }
             }
+        }
+
+        if !any_ok {
+            return None
         }
 
         Some(DecodedMessage {
@@ -371,6 +375,24 @@ impl Parser {
         })
     }
 
+    /// Handles bounds checking for big endian signal conventions
+    fn motorola_fits(data_len: usize, start_bit: usize, size: usize) -> bool {
+        if data_len == 0 || size == 0 {
+            return false;
+        }
+        let start_byte = start_bit / 8;
+        let bit_in_byte = start_bit % 8;
+
+        // start_bit points to MSB; in lsb0 indexing, MSB is bit 7.
+        // Motorola consumes bits down to 0, then continues at next byte's bit 7.
+        let bits_first_byte = bit_in_byte + 1;
+        let remaining = size.saturating_sub(bits_first_byte);
+        let extra_bytes = (remaining + 7) / 8; // ceil
+        let bytes_needed = 1 + extra_bytes;
+
+        start_byte + bytes_needed <= data_len
+    }
+
     /// Extracts raw signal bits from CAN data.
     ///
     /// Handles both little-endian and big-endian byte ordering according to
@@ -386,23 +408,25 @@ impl Parser {
             return None;
         }
 
-        let total_bits = data.len() * 8;
-        if start_bit + size > total_bits {
-            return None;
-        }
-
-        let mut result = 0u64;
-
         match byte_order {
             can_dbc::ByteOrder::LittleEndian => {
+                let total_bits = data.len() * 8;
+                if start_bit + size > total_bits {
+                    return None;
+                }
+
                 let start_byte = start_bit / 8;
                 let start_bit_in_byte = start_bit % 8;
 
+                let mut result = 0u64;
                 let mut remaining_bits = size;
                 let mut current_byte = start_byte;
                 let mut bit_offset = start_bit_in_byte;
 
-                while remaining_bits > 0 && current_byte < data.len() {
+                while remaining_bits > 0 {
+                    if current_byte >= data.len() {
+                        return None; // should not happen due to bounds check, but be strict
+                    }
                     let bits_in_this_byte = std::cmp::min(remaining_bits, 8 - bit_offset);
                     let mask = ((1u64 << bits_in_this_byte) - 1) << bit_offset;
                     let byte_value = ((data[current_byte] as u64) & mask) >> bit_offset;
@@ -413,30 +437,42 @@ impl Parser {
                     current_byte += 1;
                     bit_offset = 0;
                 }
+
+                Some(result)
             }
+
             can_dbc::ByteOrder::BigEndian => {
-                // Big-endian (Motorola) bit extraction: iterate bits from
-                // start_bit toward higher bit positions, collecting each bit
-                // and appending into the result MSB-first.
-                let mut bit_pos = start_bit;
+                // motorola (DBC / Vector-style): start_bit is MSB in lsb0 numbering.
+                // bits walk: within byte 7..0, then next byte 7..0, etc.
+                if !motorola_fits(data.len(), start_bit, size) {
+                    return None;
+                }
+
+                let mut result = 0u64;
+
+                let mut byte_idx = start_bit / 8;
+                let mut bit_in_byte = start_bit % 8; // 0=LSB, 7=MSB (lsb0 indexing)
 
                 for _ in 0..size {
-                    let byte_idx = bit_pos / 8;
-                    let bit_idx = 7 - (bit_pos % 8);
-
                     if byte_idx >= data.len() {
-                        break;
+                        return None;
                     }
 
-                    let bit_val = (data[byte_idx] >> bit_idx) & 1;
+                    let bit_val = (data[byte_idx] >> bit_in_byte) & 1;
                     result = (result << 1) | (bit_val as u64);
 
-                    bit_pos += 1;
+                    // move "down" within the byte, then jump to next byte's MSB
+                    if bit_in_byte == 0 {
+                        bit_in_byte = 7;
+                        byte_idx += 1;
+                    } else {
+                        bit_in_byte -= 1;
+                    }
                 }
+
+                Some(result)
             }
         }
-
-        Some(result)
     }
 
     /// Encodes a CAN message from signal values into raw bytes.
