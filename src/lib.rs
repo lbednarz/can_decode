@@ -96,6 +96,24 @@ pub struct DecodedSignal {
     pub unit: String,
 }
 
+/// Handles bounds checking for big endian signal conventions
+fn motorola_fits(data_len: usize, start_bit: usize, size: usize) -> bool {
+    if data_len == 0 || size == 0 {
+        return false;
+    }
+    let start_byte = start_bit / 8;
+    let bit_in_byte = start_bit % 8;
+
+    // start_bit points to MSB; in lsb0 indexing, MSB is bit 7.
+    // Motorola consumes bits down to 0, then continues at next byte's bit 7.
+    let bits_first_byte = bit_in_byte + 1;
+    let remaining = size.saturating_sub(bits_first_byte);
+    let extra_bytes = (remaining + 7) / 8; // ceil
+    let bytes_needed = 1 + extra_bytes;
+
+    start_byte + bytes_needed <= data_len
+}
+
 /// A CAN message parser that uses DBC file definitions.
 ///
 /// The parser loads message and signal definitions from DBC files and uses them
@@ -373,24 +391,6 @@ impl Parser {
             value: scaled_value,
             unit: signal_def.unit.clone(),
         })
-    }
-
-    /// Handles bounds checking for big endian signal conventions
-    fn motorola_fits(data_len: usize, start_bit: usize, size: usize) -> bool {
-        if data_len == 0 || size == 0 {
-            return false;
-        }
-        let start_byte = start_bit / 8;
-        let bit_in_byte = start_bit % 8;
-
-        // start_bit points to MSB; in lsb0 indexing, MSB is bit 7.
-        // Motorola consumes bits down to 0, then continues at next byte's bit 7.
-        let bits_first_byte = bit_in_byte + 1;
-        let remaining = size.saturating_sub(bits_first_byte);
-        let extra_bytes = (remaining + 7) / 8; // ceil
-        let bytes_needed = 1 + extra_bytes;
-
-        start_byte + bytes_needed <= data_len
     }
 
     /// Extracts raw signal bits from CAN data.
