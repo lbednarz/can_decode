@@ -329,6 +329,7 @@ impl Parser {
         for signal_def in &msg_def.signals {
             match self.decode_signal(signal_def, data) {
                 Some(decoded_signal) => {
+                    any_ok = true;
                     decoded_signals.insert(decoded_signal.name.to_string(), decoded_signal);
                 }
                 None => {
@@ -342,7 +343,7 @@ impl Parser {
         }
 
         if !any_ok {
-            return None
+            return None;
         }
 
         Some(DecodedMessage {
