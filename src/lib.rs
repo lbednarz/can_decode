@@ -96,24 +96,6 @@ pub struct DecodedSignal {
     pub unit: String,
 }
 
-/// Handles bounds checking for big endian signal conventions
-fn motorola_fits(data_len: usize, start_bit: usize, size: usize) -> bool {
-    if data_len == 0 || size == 0 {
-        return false;
-    }
-    let start_byte = start_bit / 8;
-    let bit_in_byte = start_bit % 8;
-
-    // start_bit points to MSB; in lsb0 indexing, MSB is bit 7.
-    // Motorola consumes bits down to 0, then continues at next byte's bit 7.
-    let bits_first_byte = bit_in_byte + 1;
-    let remaining = size.saturating_sub(bits_first_byte);
-    let extra_bytes = (remaining + 7) / 8; // ceil
-    let bytes_needed = 1 + extra_bytes;
-
-    start_byte + bytes_needed <= data_len
-}
-
 /// A CAN message parser that uses DBC file definitions.
 ///
 /// The parser loads message and signal definitions from DBC files and uses them
@@ -159,6 +141,24 @@ impl Parser {
         Self {
             msg_defs: std::collections::HashMap::new(),
         }
+    }
+
+    /// Handles bounds checking for big endian signal conventions
+    fn motorola_fits(data_len: usize, start_bit: usize, size: usize) -> bool {
+        if data_len == 0 || size == 0 {
+            return false;
+        }
+        let start_byte = start_bit / 8;
+        let bit_in_byte = start_bit % 8;
+
+        // start_bit points to MSB; in lsb0 indexing, MSB is bit 7.
+        // Motorola consumes bits down to 0, then continues at next byte's bit 7.
+        let bits_first_byte = bit_in_byte + 1;
+        let remaining = size.saturating_sub(bits_first_byte);
+        let extra_bytes = (remaining + 7) / 8; // ceil
+        let bytes_needed = 1 + extra_bytes;
+
+        start_byte + bytes_needed <= data_len
     }
 
     /// Creates a parser and loads definitions from a DBC file.
@@ -445,7 +445,7 @@ impl Parser {
             can_dbc::ByteOrder::BigEndian => {
                 // motorola (DBC / Vector-style): start_bit is MSB in lsb0 numbering.
                 // bits walk: within byte 7..0, then next byte 7..0, etc.
-                if !motorola_fits(data.len(), start_bit, size) {
+                if !Self::motorola_fits(data.len(), start_bit, size) {
                     return None;
                 }
 
