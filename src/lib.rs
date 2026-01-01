@@ -94,6 +94,10 @@ pub struct DecodedSignal {
     pub value: f64,
     /// The unit of measurement (e.g., "km/h", "°C", "RPM")
     pub unit: String,
+    /// Raw integer (signed/unsigned interpreted)
+    pub raw: i64,
+    /// Categorical string if a VAL_ exists
+    pub value_text: Option<String>,
 }
 
 /// A CAN message parser that uses DBC file definitions.
@@ -119,9 +123,11 @@ pub struct DecodedSignal {
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Default)]
 pub struct Parser {
     /// Map of message ID to message definitions
     msg_defs: std::collections::HashMap<u32, can_dbc::Message>,
+    dbcs: Vec<can_dbc::Dbc>,
 }
 
 impl Parser {
@@ -140,6 +146,7 @@ impl Parser {
     pub fn new() -> Self {
         Self {
             msg_defs: std::collections::HashMap::new(),
+            dbcs: Vec::new(),
         }
     }
 
@@ -204,7 +211,7 @@ impl Parser {
             log::error!("Failed to parse DBC: {:?}", e);
             format!("{:?}", e)
         })?;
-        for msg_def in dbc.messages {
+        for msg_def in dbc.messages.iter() {
             let msg_id = match msg_def.id {
                 can_dbc::MessageId::Standard(id) => id as u32,
                 can_dbc::MessageId::Extended(id) => id,
@@ -217,6 +224,10 @@ impl Parser {
             }
             self.msg_defs.insert(msg_id, msg_def.clone());
         }
+
+        // now we can move the dbc into storage
+        self.dbcs.push(dbc);
+
         Ok(())
     }
 
@@ -255,6 +266,23 @@ impl Parser {
         let s = String::from_utf8(buffer)?;
         self.add_from_str(&s)?;
         Ok(())
+    }
+
+    /// Finds any categorical values from a VAL_ entry in the src DBC.
+    fn value_text_for_signal(
+        &self,
+        message_id: can_dbc::MessageId,
+        signal_name: &str,
+        raw: i64,
+    ) -> Option<String> {
+        for dbc in &self.dbcs {
+            if let Some(descs) = dbc.value_descriptions_for_signal(message_id, signal_name) {
+                if let Some(hit) = descs.iter().find(|d| d.id == raw) {
+                    return Some(hit.description.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Decodes a raw CAN message into structured data.
@@ -309,7 +337,7 @@ impl Parser {
         let mut any_ok = false;
 
         for signal_def in &msg_def.signals {
-            match self.decode_signal(signal_def, data) {
+            match self.decode_signal(msg_def.id, signal_def, data) {
                 Some(decoded_signal) => {
                     any_ok = true;
                     decoded_signals.insert(decoded_signal.name.to_string(), decoded_signal);
@@ -341,38 +369,48 @@ impl Parser {
     ///
     /// Extracts the raw bits for a signal, converts to signed/unsigned as needed,
     /// and applies the scaling factor and offset to produce the physical value.
-    fn decode_signal(&self, signal_def: &can_dbc::Signal, data: &[u8]) -> Option<DecodedSignal> {
+    fn decode_signal(
+        &self,
+        message_id: can_dbc::MessageId,
+        signal_def: &can_dbc::Signal,
+        data: &[u8],
+    ) -> Option<DecodedSignal> {
         // Extract raw value based on byte order and signal properties
-        let raw_value = self.extract_signal_value(
+        let raw_u64 = self.extract_signal_value(
             data,
             signal_def.start_bit as usize,
             signal_def.size as usize,
             signal_def.byte_order,
         )?;
 
-        // Convert to signed if needed
-        let raw_value = if signal_def.value_type == can_dbc::ValueType::Signed {
-            // Convert to signed based on signal size
-            let max_unsigned = (1u64 << signal_def.size) - 1;
+        // interpret raw as signed/unsigned integer for lookup + scaling
+        let raw_i64: i64 = if signal_def.value_type == can_dbc::ValueType::Signed {
             let sign_bit = 1u64 << (signal_def.size - 1);
+            let mask = (1u64 << signal_def.size) - 1;
 
-            if raw_value & sign_bit != 0 {
-                // Negative number - extend sign
-                (raw_value | (!max_unsigned)) as i64 as f64
+            let v = raw_u64 & mask;
+            if (v & sign_bit) != 0 {
+                // sign extend into i64
+                (v | (!mask)) as i64
             } else {
-                raw_value as f64
+                v as i64
             }
         } else {
-            raw_value as f64
+            raw_u64 as i64
         };
 
         // Apply scaling
-        let scaled_value = raw_value * signal_def.factor + signal_def.offset;
+        let scaled_value = (raw_i64 as f64) * signal_def.factor + signal_def.offset;
+
+        // If VAL_ exists, map raw_i64 -> string
+        let value_text = self.value_text_for_signal(message_id, &signal_def.name, raw_i64);
 
         Some(DecodedSignal {
             name: signal_def.name.clone(),
             value: scaled_value,
             unit: signal_def.unit.clone(),
+            raw: raw_i64,
+            value_text,
         })
     }
 
@@ -841,11 +879,5 @@ impl Parser {
     /// ```
     pub fn clear(&mut self) {
         self.msg_defs.clear();
-    }
-}
-
-impl Default for Parser {
-    fn default() -> Self {
-        Self::new()
     }
 }
